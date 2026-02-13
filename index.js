@@ -19,7 +19,7 @@ bot.start((ctx) => ctx.reply("Бот работает 🚀"));
 const secret = "8e20866bcb3017a91fde937cbd6a55c1755d5d35604184cd16a154b903e77012";
 const hookPath = `/telegraf/${secret}`;
 
-app.use(bot.webhookCallback(hookPath));
+app.use(hookPath, bot.webhookCallback(hookPath));
 
 app.get("/", (req, res) => {
   res.send("OK");
