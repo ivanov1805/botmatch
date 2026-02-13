@@ -27,12 +27,9 @@ app.get("/", (req, res) => {
 
 const port = process.env.PORT || 3000;
 
-app.listen(port, async () => {
+app.listen(port, () => {
   console.log("SERVER STARTED ON PORT", port);
-
-  await bot.telegram.setWebhook(
-    `${process.env.WEBHOOK_URL}${hookPath}`
-  );
+});
 
   console.log("WEBHOOK SET");
 });
