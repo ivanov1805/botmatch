@@ -12,14 +12,87 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// ===== TEST COMMAND =====
-bot.start((ctx) => ctx.reply("Бот работает 🚀"));
+// ===== INIT DB =====
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS games (
+      id SERIAL PRIMARY KEY,
+      location TEXT,
+      date TEXT,
+      time TEXT,
+      format TEXT,
+      pairs INTEGER DEFAULT 0
+    );
+  `);
 
-// ===== WEBHOOK CONFIG =====
-const secret = "8e20866bcb3017a91fde937cbd6a55c1755d5d35604184cd16a154b903e77012";
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS registrations (
+      id SERIAL PRIMARY KEY,
+      game_id INTEGER REFERENCES games(id) ON DELETE CASCADE,
+      player1 TEXT,
+      player2 TEXT
+    );
+  `);
+}
+
+initDB();
+
+// ===== START =====
+bot.start(async (ctx) => {
+  await ctx.reply(
+    "🏸 Открытая игра\n\nВыберите действие:",
+    Markup.inlineKeyboard([
+      [Markup.button.callback("Создать игру", "CREATE_GAME")],
+      [Markup.button.callback("Список игр", "LIST_GAMES")]
+    ])
+  );
+});
+
+// ===== CREATE GAME =====
+bot.action("CREATE_GAME", async (ctx) => {
+  await pool.query(`
+    INSERT INTO games (location, date, time, format)
+    VALUES ('Мультиспорт', 'Суббота', '12:00', 'Микс')
+  `);
+
+  await ctx.reply("Игра создана.");
+});
+
+// ===== LIST GAMES =====
+bot.action("LIST_GAMES", async (ctx) => {
+  const result = await pool.query("SELECT * FROM games ORDER BY id DESC LIMIT 5");
+
+  if (result.rows.length === 0) {
+    return ctx.reply("Игр пока нет.");
+  }
+
+  for (const game of result.rows) {
+    await ctx.reply(
+      `🏸 Игра #${game.id}\n📍 ${game.location}\n🗓 ${game.date}\n⏰ ${game.time}\n🎯 ${game.format}`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Записаться", `JOIN_${game.id}`)]
+      ])
+    );
+  }
+});
+
+// ===== JOIN GAME =====
+bot.action(/JOIN_(\d+)/, async (ctx) => {
+  const gameId = ctx.match[1];
+
+  await pool.query(
+    "INSERT INTO registrations (game_id, player1, player2) VALUES ($1, $2, $3)",
+    [gameId, ctx.from.first_name, "Второй игрок"]
+  );
+
+  await ctx.reply("Вы записаны.");
+});
+
+// ===== WEBHOOK =====
+const secret = process.env.BOT_TOKEN;
 const hookPath = `/telegraf/${secret}`;
 
-app.use(hookPath, bot.webhookCallback(hookPath));
+app.use(bot.webhookCallback(hookPath));
 
 app.get("/", (req, res) => {
   res.send("OK");
@@ -27,9 +100,13 @@ app.get("/", (req, res) => {
 
 const port = process.env.PORT || 3000;
 
-app.listen(port, () => {
+app.listen(port, async () => {
   console.log("SERVER STARTED ON PORT", port);
-});
 
-  console.log("WEBHOOK SET");
+  if (process.env.WEBHOOK_URL) {
+    await bot.telegram.setWebhook(
+      `${process.env.WEBHOOK_URL}${hookPath}`
+    );
+    console.log("WEBHOOK SET");
+  }
 });
