@@ -1,3 +1,6 @@
+process.on("uncaughtException", console.error);
+process.on("unhandledRejection", console.error);
+
 require("dotenv").config();
 const express = require("express");
 const { Telegraf, Markup } = require("telegraf");
@@ -102,6 +105,7 @@ const port = process.env.PORT || 3000;
 
 app.listen(port, async () => {
   console.log("SERVER STARTED ON PORT", port);
+});
 
   if (process.env.WEBHOOK_URL) {
     await bot.telegram.setWebhook(
