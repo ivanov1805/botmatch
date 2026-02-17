@@ -4,223 +4,373 @@ const express = require("express");
 const { Telegraf, Markup } = require("telegraf");
 const { Pool } = require("pg");
 
+// ============ ENV CHECK ============
+const requiredEnv = ["BOT_TOKEN", "DATABASE_URL", "CHANNEL_ID", "PUBLIC_BASE_URL"];
+for (const k of requiredEnv) {
+  if (!process.env[k]) {
+    console.error(`Missing env: ${k}`);
+    process.exit(1);
+  }
+}
+
 const app = express();
+app.use(express.json());
+
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
 });
 
-// ================= STATE =================
+const CHANNEL_ID = process.env.CHANNEL_ID; // e.g. -1001234567890
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL.replace(/\/+$/, ""); // https://xxxx.up.railway.app
 
-const state = {};
+// ============ STATE MACHINE ============
+const State = Object.freeze({
+  IDLE: "IDLE",
 
-// ================= START =================
+  CREATE_WAIT_LOCATION: "CREATE_WAIT_LOCATION",
+  CREATE_WAIT_DATE: "CREATE_WAIT_DATE",
+  CREATE_WAIT_TIME: "CREATE_WAIT_TIME",
+  CREATE_WAIT_ORG2_NAME: "CREATE_WAIT_ORG2_NAME",
 
-bot.start(async (ctx) => {
-  await ctx.reply(
-    "🏸 Badm Match Maker\n\nВыберите действие:",
-    Markup.inlineKeyboard([
-      [Markup.button.callback("Создать игру", "CREATE")],
-      [Markup.button.callback("Активные игры", "LIST")]
-    ])
-  );
+  JOIN_WAIT_SECOND_PLAYER: "JOIN_WAIT_SECOND_PLAYER",
 });
 
-// ================= CREATE FLOW =================
+const sessions = new Map(); // key: telegram userId -> { state, data }
 
-bot.action("CREATE", async (ctx) => {
-  await ctx.answerCbQuery();
-  state[ctx.from.id] = { step: "location" };
-  await ctx.reply("Введите локацию:");
-});
-
-bot.on("text", async (ctx) => {
-  const userId = ctx.from.id;
-  const session = state[userId];
-  if (!session) return;
-
-  if (session.step === "location") {
-    session.location = ctx.message.text;
-    session.step = "date";
-    return ctx.reply("Введите дату (25.02.2026):");
+function getSession(userId) {
+  if (!sessions.has(userId)) {
+    sessions.set(userId, { state: State.IDLE, data: {} });
   }
+  return sessions.get(userId);
+}
 
-  if (session.step === "date") {
-    session.date = ctx.message.text;
-    session.step = "time";
-    return ctx.reply("Введите время (19:00):");
-  }
+function resetSession(userId) {
+  sessions.set(userId, { state: State.IDLE, data: {} });
+}
 
-  if (session.step === "time") {
-    session.time = ctx.message.text;
-    session.step = "organizer2";
-    return ctx.reply("Введите имя и фамилию второго организатора:");
-  }
+// ============ DB INIT ============
+async function ensureSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS games (
+      id SERIAL PRIMARY KEY,
+      location TEXT NOT NULL,
+      date TEXT NOT NULL,
+      time TEXT NOT NULL,
 
-  if (session.step === "organizer2") {
-    session.organizer2 = ctx.message.text;
+      organizer1_name TEXT NOT NULL,
+      organizer1_user_id BIGINT NOT NULL,
+      organizer1_username TEXT,
 
-    const organizer1 = `${ctx.from.first_name || ""} ${ctx.from.last_name || ""}`.trim();
+      organizer2_name TEXT NOT NULL,
 
-    const result = await pool.query(
-      `INSERT INTO games
-      (location, date, time, organizer1, organizer2, pairs, is_closed)
-      VALUES ($1,$2,$3,$4,$5,$6,$7)
-      RETURNING id`,
-      [
-        session.location,
-        session.date,
-        session.time,
-        organizer1,
-        session.organizer2,
-        [`${organizer1} / ${session.organizer2}`],
-        false
-      ]
+      pairs TEXT[] NOT NULL DEFAULT '{}',
+      is_closed BOOLEAN NOT NULL DEFAULT false,
+
+      channel_message_id BIGINT
     );
+  `);
+}
 
-    const gameId = result.rows[0].id;
-    delete state[userId];
+// ============ HELPERS ============
+function safeFullName(ctx) {
+  const fn = (ctx.from.first_name || "").trim();
+  const ln = (ctx.from.last_name || "").trim();
+  return `${fn}${ln ? " " + ln : ""}`.trim();
+}
 
-    await publishGame(gameId);
-    return ctx.reply("Игра создана ✅");
-  }
+function escapeText(s) {
+  return String(s ?? "").replace(/\s+/g, " ").trim();
+}
 
-  if (session.step === "join_second") {
-    const second = ctx.message.text;
-    const first = `${ctx.from.first_name || ""} ${ctx.from.last_name || ""}`.trim();
-    const pair = `${first} / ${second}`;
+function organizerContactUrl(userId, username) {
+  const u = (username || "").replace(/^@/, "").trim();
+  if (u) return `https://t.me/${u}`;
+  // Telegram deep link for opening chat with user by id (works in clients)
+  return `tg://user?id=${userId}`;
+}
 
-    await pool.query(
-      "UPDATE games SET pairs = array_append(pairs,$1) WHERE id=$2",
-      [pair, session.gameId]
-    );
+function formatGameText(game) {
+  const pairs = Array.isArray(game.pairs) ? [...game.pairs] : [];
+  while (pairs.length < 3) pairs.push("—");
 
-    const { rows } = await pool.query(
-      "SELECT pairs FROM games WHERE id=$1",
-      [session.gameId]
-    );
-
-    if (rows[0].pairs.length >= 3) {
-      await pool.query(
-        "UPDATE games SET is_closed=true WHERE id=$1",
-        [session.gameId]
-      );
-    }
-
-    delete state[userId];
-    await publishGame(session.gameId);
-    return ctx.reply("Вы записаны ✅");
-  }
-});
-
-// ================= LIST =================
-
-bot.action("LIST", async (ctx) => {
-  await ctx.answerCbQuery();
-
-  const { rows } = await pool.query(
-    "SELECT * FROM games WHERE is_closed=false"
-  );
-
-  if (!rows.length) return ctx.reply("Активных игр нет.");
-
-  for (const game of rows) {
-    await ctx.reply(
-      formatGame(game),
-      Markup.inlineKeyboard([
-        [Markup.button.callback("Записаться парой", `JOIN_${game.id}`)]
-      ])
-    );
-  }
-});
-
-// ================= JOIN =================
-
-bot.action(/JOIN_(.+)/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const gameId = ctx.match[1];
-
-  const { rows } = await pool.query(
-    "SELECT * FROM games WHERE id=$1",
-    [gameId]
-  );
-
-  if (!rows.length) return;
-  const game = rows[0];
-
-  if (game.is_closed) {
-    return ctx.reply("Запись закрыта.");
-  }
-
-  if (game.pairs.length >= 3) {
-    return ctx.reply("Игра уже заполнена.");
-  }
-
-  state[ctx.from.id] = {
-    step: "join_second",
-    gameId
-  };
-
-  return ctx.reply("Введите имя и фамилию второго игрока:");
-});
-
-// ================= FORMAT =================
-
-function formatGame(game) {
-  const list = [...game.pairs];
-  while (list.length < 3) list.push("—");
-
-  return `📍 ${game.location}
+  return `🏸 ${game.location}
 📅 ${game.date}
 🕒 ${game.time}
 
 👤 Организаторы:
-${game.organizer1} / ${game.organizer2}
+${game.organizer1_name} / ${game.organizer2_name}
 
 🎯 Формат допуска:
 • Мастер + Любитель
 • Два продвинутых любителя
 
 👥 Пары:
-1️⃣ ${list[0]}
-2️⃣ ${list[1]}
-3️⃣ ${list[2]}`;
+1️⃣ ${pairs[0]}
+2️⃣ ${pairs[1]}
+3️⃣ ${pairs[2]}
+
+ℹ️ Выписаться можно только написав организатору.`;
 }
 
-async function publishGame(id) {
-  const { rows } = await pool.query(
-    "SELECT * FROM games WHERE id=$1",
-    [id]
-  );
+function gameKeyboard(game) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("✅ Записаться парой", `join:${game.id}`)],
+    [
+      Markup.button.url(
+        "✉️ Написать организатору",
+        organizerContactUrl(game.organizer1_user_id, game.organizer1_username)
+      ),
+    ],
+  ]);
+}
 
-  const game = rows[0];
+async function loadGame(gameId) {
+  const { rows } = await pool.query("SELECT * FROM games WHERE id=$1", [gameId]);
+  return rows[0] || null;
+}
 
-  await bot.telegram.sendMessage(
-    process.env.CHANNEL_ID,
-    formatGame(game),
-    {
-      reply_markup: Markup.inlineKeyboard([
-        [Markup.button.callback("Записаться парой", `JOIN_${id}`)]
-      ]).reply_markup
+async function publishGame(gameId) {
+  const game = await loadGame(gameId);
+  if (!game) return;
+
+  const text = formatGameText(game);
+  const keyboard = gameKeyboard(game);
+
+  // If already posted to channel - edit, else send and save message_id
+  if (game.channel_message_id) {
+    try {
+      await bot.telegram.editMessageText(
+        CHANNEL_ID,
+        Number(game.channel_message_id),
+        undefined,
+        text,
+        keyboard
+      );
+      return;
+    } catch (e) {
+      // Message could be deleted or edit not allowed - fallback to send new
+      console.error("editMessageText failed, fallback to send:", e?.message || e);
     }
+  }
+
+  const sent = await bot.telegram.sendMessage(CHANNEL_ID, text, keyboard);
+  await pool.query("UPDATE games SET channel_message_id=$1 WHERE id=$2", [
+    sent.message_id,
+    gameId,
+  ]);
+}
+
+// ============ BOT UI ============
+async function sendMainMenu(ctx) {
+  return ctx.reply(
+    "🏸 Badm Match Maker\n\nВыбери действие:",
+    Markup.inlineKeyboard([
+      [Markup.button.callback("➕ Создать игру", "create")],
+      [Markup.button.callback("📋 Список игр", "list")],
+    ])
   );
 }
 
-// ================= WEBHOOK =================
+bot.start(async (ctx) => {
+  resetSession(ctx.from.id);
+  await sendMainMenu(ctx);
+});
 
-const secret = "8e20866bcb3017a91fde937cbd6a55c1755d5d35604184cd16a154b903e77012";
-const hookPath = `/telegraf/${secret}`;
+bot.action("create", async (ctx) => {
+  await ctx.answerCbQuery();
+  const s = getSession(ctx.from.id);
+  s.state = State.CREATE_WAIT_LOCATION;
+  s.data = {};
+  await ctx.reply("Введите локацию (например: Лужники):");
+});
 
-app.use(bot.webhookCallback(hookPath));
+bot.action("list", async (ctx) => {
+  await ctx.answerCbQuery();
 
-app.get("/", (req, res) => res.send("OK"));
+  const { rows } = await pool.query("SELECT * FROM games WHERE is_closed=false ORDER BY id DESC LIMIT 20");
+  if (!rows.length) return ctx.reply("Активных игр нет.");
 
-const port = process.env.PORT || 8080;
+  for (const g of rows) {
+    await ctx.reply(formatGameText(g), gameKeyboard(g));
+  }
+});
 
-app.listen(port, async () => {
-  console.log("SERVER STARTED ON PORT", port);
-  await bot.telegram.setWebhook(`${process.env.WEBHOOK_URL}${hookPath}`);
-  console.log("WEBHOOK SET");
+bot.action(/^join:(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const gameId = Number(ctx.match[1]);
+
+  const game = await loadGame(gameId);
+  if (!game) return ctx.reply("Игра не найдена.");
+
+  if (game.is_closed) return ctx.reply("⛔ Запись закрыта.");
+  const pairs = Array.isArray(game.pairs) ? game.pairs : [];
+  if (pairs.length >= 3) return ctx.reply("⛔ Уже 3 пары. Запись закрыта.");
+
+  const s = getSession(ctx.from.id);
+  s.state = State.JOIN_WAIT_SECOND_PLAYER;
+  s.data = { joinGameId: gameId };
+
+  await ctx.reply("Введите имя и фамилию второго игрока вашей пары:");
+});
+
+// ============ SINGLE TEXT HANDLER (NO DUPLICATES) ============
+bot.on("text", async (ctx) => {
+  const userId = ctx.from.id;
+  const text = escapeText(ctx.message.text);
+  const s = getSession(userId);
+
+  // allow reset command
+  if (text === "/cancel" || text === "отмена") {
+    resetSession(userId);
+    return ctx.reply("Ок, отменил. /start чтобы начать заново.");
+  }
+
+  switch (s.state) {
+    case State.CREATE_WAIT_LOCATION: {
+      if (!text) return ctx.reply("Локация не должна быть пустой. Введите ещё раз:");
+      s.data.location = text;
+      s.state = State.CREATE_WAIT_DATE;
+      return ctx.reply("Введите дату (например 25.02.2026):");
+    }
+
+    case State.CREATE_WAIT_DATE: {
+      if (!text) return ctx.reply("Дата не должна быть пустой. Введите ещё раз:");
+      s.data.date = text;
+      s.state = State.CREATE_WAIT_TIME;
+      return ctx.reply("Введите время (например 19:00):");
+    }
+
+    case State.CREATE_WAIT_TIME: {
+      if (!text) return ctx.reply("Время не должно быть пустым. Введите ещё раз:");
+      s.data.time = text;
+      s.state = State.CREATE_WAIT_ORG2_NAME;
+      return ctx.reply("Введите имя и фамилию второго организатора (ваш партнёр):");
+    }
+
+    case State.CREATE_WAIT_ORG2_NAME: {
+      if (!text) return ctx.reply("Имя/фамилия не должны быть пустыми. Введите ещё раз:");
+      s.data.organizer2 = text;
+
+      const organizer1Name = safeFullName(ctx) || "Организатор";
+      const organizer2Name = s.data.organizer2;
+
+      // organizer pair is always pre-filled (по умолчанию)
+      const pair = `${organizer1Name} / ${organizer2Name}`;
+
+      const { rows } = await pool.query(
+        `INSERT INTO games
+          (location, date, time, organizer1_name, organizer1_user_id, organizer1_username, organizer2_name, pairs, is_closed)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         RETURNING id`,
+        [
+          s.data.location,
+          s.data.date,
+          s.data.time,
+          organizer1Name,
+          Number(ctx.from.id),
+          ctx.from.username || null,
+          organizer2Name,
+          [pair],
+          false,
+        ]
+      );
+
+      const gameId = rows[0].id;
+
+      resetSession(userId);
+
+      await publishGame(gameId);
+      await ctx.reply("Игра создана ✅\nПост опубликован в канале.");
+
+      return sendMainMenu(ctx);
+    }
+
+    case State.JOIN_WAIT_SECOND_PLAYER: {
+      const gameId = s.data.joinGameId;
+      if (!gameId) {
+        resetSession(userId);
+        return ctx.reply("Сессия сломалась. /start");
+      }
+      if (!text) return ctx.reply("Имя/фамилия не должны быть пустыми. Введите ещё раз:");
+
+      const game = await loadGame(gameId);
+      if (!game) {
+        resetSession(userId);
+        return ctx.reply("Игра не найдена. /start");
+      }
+      if (game.is_closed) {
+        resetSession(userId);
+        return ctx.reply("⛔ Запись закрыта.");
+      }
+
+      // re-check capacity
+      const pairs = Array.isArray(game.pairs) ? [...game.pairs] : [];
+      if (pairs.length >= 3) {
+        resetSession(userId);
+        return ctx.reply("⛔ Уже 3 пары. Запись закрыта.");
+      }
+
+      const firstPlayer = safeFullName(ctx) || "Игрок";
+      const secondPlayer = text;
+      const pair = `${firstPlayer} / ${secondPlayer}`;
+
+      // prevent duplicate same pair string (simple guard)
+      if (pairs.includes(pair)) {
+        resetSession(userId);
+        return ctx.reply("Эта пара уже записана.");
+      }
+
+      // update atomically
+      await pool.query(
+        `UPDATE games
+         SET pairs = array_append(pairs, $1)
+         WHERE id = $2`,
+        [pair, gameId]
+      );
+
+      const updated = await loadGame(gameId);
+      const updatedPairs = Array.isArray(updated.pairs) ? updated.pairs : [];
+
+      if (updatedPairs.length >= 3) {
+        await pool.query("UPDATE games SET is_closed=true WHERE id=$1", [gameId]);
+      }
+
+      resetSession(userId);
+
+      await publishGame(gameId);
+      await ctx.reply("Записал ✅\nЕсли нужно выписаться — напиши организатору.");
+
+      return sendMainMenu(ctx);
+    }
+
+    case State.IDLE:
+    default:
+      return ctx.reply("Я тебя понял, но сейчас нет активного действия.\nНажми /start");
+  }
+});
+
+// ============ WEBHOOK + EXPRESS ============
+app.get("/", (_req, res) => res.status(200).send("OK"));
+
+app.use(bot.webhookCallback("/telegraf"));
+
+async function main() {
+  await ensureSchema();
+
+  const port = process.env.PORT || 8080;
+  app.listen(port, async () => {
+    console.log(`SERVER STARTED ON PORT ${port}`);
+
+    const webhookUrl = `${PUBLIC_BASE_URL}/telegraf`;
+    await bot.telegram.setWebhook(webhookUrl);
+    console.log("WEBHOOK SET", webhookUrl);
+  });
+}
+
+main().catch((e) => {
+  console.error("FATAL:", e);
+  process.exit(1);
 });
