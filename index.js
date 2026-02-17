@@ -103,14 +103,12 @@ app.get("/", (req, res) => {
 
 const port = process.env.PORT || 3000;
 
-app.listen(port, async () => {
+app.listen(port, () => {
   console.log("SERVER STARTED ON PORT", port);
-});
 
-  if (process.env.WEBHOOK_URL) {
-    await bot.telegram.setWebhook(
-      `${process.env.WEBHOOK_URL}${hookPath}`
-    );
-    console.log("WEBHOOK SET");
-  }
+  bot.telegram.setWebhook(
+    `${process.env.WEBHOOK_URL}${hookPath}`
+  )
+  .then(() => console.log("WEBHOOK SET"))
+  .catch((err) => console.error("WEBHOOK ERROR:", err));
 });
