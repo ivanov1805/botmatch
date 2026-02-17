@@ -5,8 +5,6 @@ const { Telegraf, Markup } = require("telegraf");
 const { Pool } = require("pg");
 
 const app = express();
-app.use(express.json());
-
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
 const pool = new Pool({
@@ -14,109 +12,62 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-const sessions = {};
+// ================= STATE =================
+
+const state = {};
 
 // ================= START =================
 
-bot.start((ctx) => {
-  ctx.reply(
-    "🏸 Badm Match Maker\n\nУ тебя есть пара, но нет соперников?\nСобираем компактные парные игры от 2 до 3 пар.\n\nВыберите действие:",
+bot.start(async (ctx) => {
+  await ctx.reply(
+    "🏸 Badm Match Maker\n\nВыберите действие:",
     Markup.inlineKeyboard([
-      [Markup.button.callback("Создать игру", "create_game")],
-      [Markup.button.callback("Список игр", "list_games")]
+      [Markup.button.callback("Создать игру", "CREATE")],
+      [Markup.button.callback("Активные игры", "LIST")]
     ])
   );
 });
 
-// ================= CREATE GAME =================
+// ================= CREATE FLOW =================
 
-bot.action("create_game", async (ctx) => {
+bot.action("CREATE", async (ctx) => {
   await ctx.answerCbQuery();
-  sessions[ctx.from.id] = { step: "location" };
-  ctx.reply("Введите локацию:");
+  state[ctx.from.id] = { step: "location" };
+  await ctx.reply("Введите локацию:");
 });
-
-// ================= LIST GAMES =================
-
-bot.action("list_games", async (ctx) => {
-  await ctx.answerCbQuery();
-
-  const { rows } = await pool.query(
-    "SELECT * FROM games WHERE is_closed=false ORDER BY id DESC"
-  );
-
-  if (!rows.length) return ctx.reply("Активных игр нет.");
-
-  for (const game of rows) {
-    await ctx.reply(
-      formatGame(game),
-      Markup.inlineKeyboard([
-        [Markup.button.callback("Записаться парой", `join_${game.id}`)],
-        [Markup.button.url("Связаться с организатором", `https://t.me/${game.organizer_username || ""}`)]
-      ])
-    );
-  }
-});
-
-// ================= JOIN GAME =================
-
-bot.action(/join_(.+)/, async (ctx) => {
-  await ctx.answerCbQuery();
-  const gameId = ctx.match[1];
-
-  const { rows } = await pool.query("SELECT * FROM games WHERE id=$1", [gameId]);
-  if (!rows.length) return;
-
-  const game = rows[0];
-
-  if (game.is_closed) return ctx.reply("⛔ Запись закрыта.");
-  if (game.pairs.length >= 3) return ctx.reply("Игра заполнена.");
-
-  sessions[ctx.from.id] = {
-    step: "join_second",
-    gameId
-  };
-
-  ctx.reply("Введите имя и фамилию второго игрока:");
-});
-
-// ================= TEXT HANDLER =================
 
 bot.on("text", async (ctx) => {
-  const session = sessions[ctx.from.id];
+  const userId = ctx.from.id;
+  const session = state[userId];
   if (!session) return;
 
-  const text = ctx.message.text;
-
-  // ===== CREATE FLOW =====
-
   if (session.step === "location") {
-    session.location = text;
+    session.location = ctx.message.text;
     session.step = "date";
-    return ctx.reply("Введите дату (например 25.02.2026):");
+    return ctx.reply("Введите дату (25.02.2026):");
   }
 
   if (session.step === "date") {
-    session.date = text;
+    session.date = ctx.message.text;
     session.step = "time";
-    return ctx.reply("Введите время (например 19:00):");
+    return ctx.reply("Введите время (19:00):");
   }
 
   if (session.step === "time") {
-    session.time = text;
+    session.time = ctx.message.text;
     session.step = "organizer2";
     return ctx.reply("Введите имя и фамилию второго организатора:");
   }
 
   if (session.step === "organizer2") {
-    session.organizer2 = text;
+    session.organizer2 = ctx.message.text;
 
     const organizer1 = `${ctx.from.first_name || ""} ${ctx.from.last_name || ""}`.trim();
 
     const result = await pool.query(
       `INSERT INTO games
-      (location, date, time, organizer1, organizer2, organizer_username, pairs, is_closed)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      (location, date, time, organizer1, organizer2, pairs, is_closed)
+      VALUES ($1,$2,$3,$4,$5,$6,$7)
       RETURNING id`,
       [
         session.location,
@@ -124,25 +75,22 @@ bot.on("text", async (ctx) => {
         session.time,
         organizer1,
         session.organizer2,
-        ctx.from.username,
         [`${organizer1} / ${session.organizer2}`],
         false
       ]
     );
 
-    delete sessions[ctx.from.id];
+    const gameId = result.rows[0].id;
+    delete state[userId];
 
-    await publishGame(result.rows[0].id);
-
+    await publishGame(gameId);
     return ctx.reply("Игра создана ✅");
   }
 
-  // ===== JOIN FLOW =====
-
   if (session.step === "join_second") {
-    const secondPlayer = text;
-    const firstPlayer = `${ctx.from.first_name || ""} ${ctx.from.last_name || ""}`.trim();
-    const pair = `${firstPlayer} / ${secondPlayer}`;
+    const second = ctx.message.text;
+    const first = `${ctx.from.first_name || ""} ${ctx.from.last_name || ""}`.trim();
+    const pair = `${first} / ${second}`;
 
     await pool.query(
       "UPDATE games SET pairs = array_append(pairs,$1) WHERE id=$2",
@@ -155,17 +103,67 @@ bot.on("text", async (ctx) => {
     );
 
     if (rows[0].pairs.length >= 3) {
-      await pool.query("UPDATE games SET is_closed=true WHERE id=$1", [
-        session.gameId
-      ]);
+      await pool.query(
+        "UPDATE games SET is_closed=true WHERE id=$1",
+        [session.gameId]
+      );
     }
 
-    delete sessions[ctx.from.id];
-
+    delete state[userId];
     await publishGame(session.gameId);
-
     return ctx.reply("Вы записаны ✅");
   }
+});
+
+// ================= LIST =================
+
+bot.action("LIST", async (ctx) => {
+  await ctx.answerCbQuery();
+
+  const { rows } = await pool.query(
+    "SELECT * FROM games WHERE is_closed=false"
+  );
+
+  if (!rows.length) return ctx.reply("Активных игр нет.");
+
+  for (const game of rows) {
+    await ctx.reply(
+      formatGame(game),
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Записаться парой", `JOIN_${game.id}`)]
+      ])
+    );
+  }
+});
+
+// ================= JOIN =================
+
+bot.action(/JOIN_(.+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const gameId = ctx.match[1];
+
+  const { rows } = await pool.query(
+    "SELECT * FROM games WHERE id=$1",
+    [gameId]
+  );
+
+  if (!rows.length) return;
+  const game = rows[0];
+
+  if (game.is_closed) {
+    return ctx.reply("Запись закрыта.");
+  }
+
+  if (game.pairs.length >= 3) {
+    return ctx.reply("Игра уже заполнена.");
+  }
+
+  state[ctx.from.id] = {
+    step: "join_second",
+    gameId
+  };
+
+  return ctx.reply("Введите имя и фамилию второго игрока:");
 });
 
 // ================= FORMAT =================
@@ -174,7 +172,7 @@ function formatGame(game) {
   const list = [...game.pairs];
   while (list.length < 3) list.push("—");
 
-  return `🎾 ${game.location}
+  return `📍 ${game.location}
 📅 ${game.date}
 🕒 ${game.time}
 
@@ -188,41 +186,41 @@ ${game.organizer1} / ${game.organizer2}
 👥 Пары:
 1️⃣ ${list[0]}
 2️⃣ ${list[1]}
-3️⃣ ${list[2]}
-
-Минимум 2 пары, максимум 3.`;
+3️⃣ ${list[2]}`;
 }
 
-// ================= PUBLISH =================
-
 async function publishGame(id) {
-  const { rows } = await pool.query("SELECT * FROM games WHERE id=$1", [id]);
+  const { rows } = await pool.query(
+    "SELECT * FROM games WHERE id=$1",
+    [id]
+  );
+
   const game = rows[0];
 
   await bot.telegram.sendMessage(
     process.env.CHANNEL_ID,
     formatGame(game),
     {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "Записаться парой", callback_data: `join_${game.id}` }]
-        ]
-      }
+      reply_markup: Markup.inlineKeyboard([
+        [Markup.button.callback("Записаться парой", `JOIN_${id}`)]
+      ]).reply_markup
     }
   );
 }
 
 // ================= WEBHOOK =================
 
-app.use(bot.webhookCallback(`/telegraf/${process.env.BOT_TOKEN}`));
+const secret = "8e20866bcb3017a91fde937cbd6a55c1755d5d35604184cd16a154b903e77012";
+const hookPath = `/telegraf/${secret}`;
 
-app.get("/", (req, res) => {
-  res.send("Bot is running");
-});
+app.use(bot.webhookCallback(hookPath));
 
-app.listen(process.env.PORT || 8080, async () => {
-  await bot.telegram.setWebhook(
-    `${process.env.WEBHOOK_URL}/telegraf/${process.env.BOT_TOKEN}`
-  );
-  console.log("SERVER STARTED");
+app.get("/", (req, res) => res.send("OK"));
+
+const port = process.env.PORT || 8080;
+
+app.listen(port, async () => {
+  console.log("SERVER STARTED ON PORT", port);
+  await bot.telegram.setWebhook(`${process.env.WEBHOOK_URL}${hookPath}`);
+  console.log("WEBHOOK SET");
 });
