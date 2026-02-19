@@ -34,6 +34,10 @@ app.use(express.json());
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
+bot.command("chatid", (ctx) => {
+  ctx.reply(`Chat ID: ${ctx.chat.id}`);
+});
+
 const useSqlite = isLocal && !process.env.DATABASE_URL;
 
 function normalizeSqliteRow(row) {
@@ -309,18 +313,18 @@ async function loadGame(gameId) {
   return rows[0] || null;
 }
 
-async function publishGame(gameId) {
+async function publishGame(gameId, chatId) {
   const game = await loadGame(gameId);
   if (!game) return;
 
   const text = formatGameText(game);
   const keyboard = gameKeyboard(game);
 
-  // If already posted to channel - edit, else send and save message_id
+  // If already posted in this chat - edit, else send and save message_id
   if (game.channel_message_id) {
     try {
       await bot.telegram.editMessageText(
-        CHANNEL_ID,
+        chatId,
         Number(game.channel_message_id),
         undefined,
         text,
@@ -333,7 +337,7 @@ async function publishGame(gameId) {
     }
   }
 
-  const sent = await bot.telegram.sendMessage(CHANNEL_ID, text, keyboard);
+  const sent = await bot.telegram.sendMessage(process.env.GROUP_ID, text, keyboard);
   await pool.query("UPDATE games SET channel_message_id=$1 WHERE id=$2", [
     sent.message_id,
     gameId,
@@ -504,7 +508,7 @@ bot.on("text", async (ctx) => {
 
       resetSession(userId);
 
-      await publishGame(gameId);
+      await publishGame(gameId, ctx.chat.id);
       await ctx.reply("Игра создана ✅\nПост опубликован в канале.");
 
       return sendMainMenu(ctx);
@@ -579,7 +583,7 @@ bot.on("text", async (ctx) => {
 
       resetSession(userId);
 
-      await publishGame(gameId);
+      await publishGame(gameId, ctx.chat.id);
       if (addedToMain) {
         await ctx.reply("Записал ✅\nЕсли нужно выписаться — напиши организатору.");
       } else {
