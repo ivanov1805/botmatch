@@ -19,11 +19,6 @@ if (!process.env.DATABASE_URL && !isLocal) {
   process.exit(1);
 }
 
-if (!process.env.CHANNEL_ID) {
-  console.error("Missing CHANNEL_ID. Set CHANNEL_ID in your environment (.env).");
-  process.exit(1);
-}
-
 if (!isLocal && !process.env.PUBLIC_BASE_URL) {
   console.error("Missing PUBLIC_BASE_URL in production.");
   process.exit(1);
@@ -147,7 +142,6 @@ const pool = useSqlite
       })
     : new Pool();
 
-const CHANNEL_ID = process.env.CHANNEL_ID; // e.g. -1001234567890
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").replace(/\/+$/, ""); // https://xxxx.up.railway.app
 
 // ============ STATE MACHINE ============
@@ -319,29 +313,7 @@ async function publishGame(gameId, chatId) {
 
   const text = formatGameText(game);
   const keyboard = gameKeyboard(game);
-
-  // If already posted in this chat - edit, else send and save message_id
-  if (game.channel_message_id) {
-    try {
-      await bot.telegram.editMessageText(
-        chatId,
-        Number(game.channel_message_id),
-        undefined,
-        text,
-        keyboard
-      );
-      return;
-    } catch (e) {
-      // Message could be deleted or edit not allowed - fallback to send new
-      console.error("editMessageText failed, fallback to send:", e?.message || e);
-    }
-  }
-
-  const sent = await bot.telegram.sendMessage(process.env.GROUP_ID, text, keyboard);
-  await pool.query("UPDATE games SET channel_message_id=$1 WHERE id=$2", [
-    sent.message_id,
-    gameId,
-  ]);
+  await bot.telegram.sendMessage(chatId, text, keyboard);
 }
 
 // ============ BOT UI ============
@@ -408,10 +380,14 @@ bot.command("games", async (ctx) => {
 
 bot.action("create", async (ctx) => {
   await ctx.answerCbQuery();
-  const s = getSession(ctx.from.id);
-  s.state = State.CREATE_WAIT_LOCATION;
-  s.data = {};
-  await ctx.reply("Введите локацию (например: Лужники):");
+  try {
+    const s = getSession(ctx.from.id);
+    s.state = State.CREATE_WAIT_LOCATION;
+    s.data = {};
+    await ctx.reply("Введите локацию (например: Лужники):");
+  } catch (err) {
+    console.error(err);
+  }
 });
 
 bot.action("list", async (ctx) => {
@@ -509,7 +485,7 @@ bot.on("text", async (ctx) => {
       resetSession(userId);
 
       await publishGame(gameId, ctx.chat.id);
-      await ctx.reply("Игра создана ✅\nПост опубликован в канале.");
+      await ctx.reply("Игра создана ✅");
 
       return sendMainMenu(ctx);
     }
