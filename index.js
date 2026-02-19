@@ -3,6 +3,8 @@ require("dotenv").config();
 const express = require("express");
 const { Telegraf, Markup } = require("telegraf");
 const { Pool } = require("pg");
+const path = require("path");
+const { DatabaseSync } = require("node:sqlite");
 
 // ============ ENV CHECK ============
 const isLocal = process.env.NODE_ENV !== "production";
@@ -32,12 +34,114 @@ app.use(express.json());
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-const pool = process.env.DATABASE_URL
-  ? new Pool({
-      connectionString: process.env.DATABASE_URL,
-      ssl: { rejectUnauthorized: false },
-    })
-  : new Pool();
+const useSqlite = isLocal && !process.env.DATABASE_URL;
+
+function normalizeSqliteRow(row) {
+  if (!row) return row;
+  const normalized = { ...row };
+  normalized.pairs = row.pairs ? JSON.parse(row.pairs) : [];
+  normalized.waiting_list = row.waiting_list ? JSON.parse(row.waiting_list) : [];
+  normalized.is_closed = Boolean(row.is_closed);
+  return normalized;
+}
+
+function toSqliteParams(params = []) {
+  return params.map((value) => (Array.isArray(value) ? JSON.stringify(value) : value));
+}
+
+function toSqliteSql(sql) {
+  return sql.replace(/\$\d+/g, "?");
+}
+
+function createSqlitePool() {
+  const dbFile = path.join(process.cwd(), "database.sqlite");
+  const db = new DatabaseSync(dbFile);
+
+  return {
+    async query(sql, params = []) {
+      const trimmedSql = sql.trim();
+
+      if (/^UPDATE\s+games\s+SET\s+pairs\s*=\s*array_append\(pairs,\s*\$1\)\s+WHERE\s+id\s*=\s*\$2/i.test(trimmedSql)) {
+        const pair = params[0];
+        const gameId = params[1];
+        const existing = db.prepare("SELECT pairs FROM games WHERE id = ?").get(gameId);
+        if (!existing) return { rows: [], rowCount: 0 };
+        const pairs = existing.pairs ? JSON.parse(existing.pairs) : [];
+        pairs.push(pair);
+        const result = db.prepare("UPDATE games SET pairs = ? WHERE id = ?").run(JSON.stringify(pairs), gameId);
+        return { rows: [], rowCount: result.changes };
+      }
+
+      if (/^UPDATE\s+games\s+SET\s+waiting_list\s*=\s*array_append\(waiting_list,\s*\$1\)\s+WHERE\s+id\s*=\s*\$2/i.test(trimmedSql)) {
+        const pair = params[0];
+        const gameId = params[1];
+        const existing = db.prepare("SELECT waiting_list FROM games WHERE id = ?").get(gameId);
+        if (!existing) return { rows: [], rowCount: 0 };
+        const waitingList = existing.waiting_list ? JSON.parse(existing.waiting_list) : [];
+        waitingList.push(pair);
+        const result = db
+          .prepare("UPDATE games SET waiting_list = ? WHERE id = ?")
+          .run(JSON.stringify(waitingList), gameId);
+        return { rows: [], rowCount: result.changes };
+      }
+
+      if (/^INSERT\s+INTO\s+games\b/i.test(trimmedSql) && /\bRETURNING\s+id\b/i.test(trimmedSql)) {
+        const [
+          location,
+          date,
+          time,
+          organizer1Name,
+          organizer1UserId,
+          organizer1Username,
+          organizer2Name,
+          pairs,
+          isClosed,
+        ] = params;
+
+        const sqliteSql = toSqliteSql(trimmedSql);
+        const sqliteParams = [
+          location ?? "",
+          date ?? "",
+          time ?? "",
+          organizer1Name ?? "",
+          organizer1UserId ?? 0,
+          organizer1Username ?? "",
+          organizer2Name ?? "",
+          JSON.stringify(Array.isArray(pairs) ? pairs : []),
+          isClosed == null ? 0 : Number(Boolean(isClosed)),
+        ];
+
+        const row = db.prepare(sqliteSql).get(...sqliteParams);
+        return { rows: row ? [normalizeSqliteRow(row)] : [], rowCount: row ? 1 : 0 };
+      }
+
+      const sqliteSql = toSqliteSql(trimmedSql);
+      const sqliteParams = toSqliteParams(params);
+
+      if (/^\s*SELECT/i.test(trimmedSql)) {
+        const rows = db.prepare(sqliteSql).all(...sqliteParams).map(normalizeSqliteRow);
+        return { rows, rowCount: rows.length };
+      }
+
+      if (/\bRETURNING\b/i.test(trimmedSql)) {
+        const row = db.prepare(sqliteSql).get(...sqliteParams);
+        return { rows: row ? [normalizeSqliteRow(row)] : [], rowCount: row ? 1 : 0 };
+      }
+
+      const result = db.prepare(sqliteSql).run(...sqliteParams);
+      return { rows: [], rowCount: result.changes };
+    },
+  };
+}
+
+const pool = useSqlite
+  ? createSqlitePool()
+  : process.env.DATABASE_URL
+    ? new Pool({
+        connectionString: process.env.DATABASE_URL,
+        ssl: { rejectUnauthorized: false },
+      })
+    : new Pool();
 
 const CHANNEL_ID = process.env.CHANNEL_ID; // e.g. -1001234567890
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").replace(/\/+$/, ""); // https://xxxx.up.railway.app
@@ -69,6 +173,26 @@ function resetSession(userId) {
 
 // ============ DB INIT ============
 async function ensureSchema() {
+  if (useSqlite) {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS games (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        location TEXT NOT NULL,
+        date TEXT NOT NULL,
+        time TEXT NOT NULL,
+        organizer1_name TEXT NOT NULL,
+        organizer1_user_id INTEGER NOT NULL,
+        organizer1_username TEXT,
+        organizer2_name TEXT NOT NULL,
+        pairs TEXT NOT NULL DEFAULT '[]',
+        is_closed INTEGER NOT NULL DEFAULT 0,
+        waiting_list TEXT NOT NULL DEFAULT '[]',
+        channel_message_id INTEGER
+      );
+    `);
+    return;
+  }
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS games (
       id SERIAL PRIMARY KEY,
