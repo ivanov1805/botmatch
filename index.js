@@ -5,12 +5,26 @@ const { Telegraf, Markup } = require("telegraf");
 const { Pool } = require("pg");
 
 // ============ ENV CHECK ============
-const requiredEnv = ["BOT_TOKEN", "DATABASE_URL", "CHANNEL_ID", "PUBLIC_BASE_URL"];
-for (const k of requiredEnv) {
-  if (!process.env[k]) {
-    console.error(`Missing env: ${k}`);
-    process.exit(1);
-  }
+const isLocal = process.env.NODE_ENV !== "production";
+
+if (!process.env.BOT_TOKEN) {
+  console.error("Missing BOT_TOKEN. Set BOT_TOKEN in your environment (.env) before starting the bot.");
+  process.exit(1);
+}
+
+if (!process.env.DATABASE_URL && !isLocal) {
+  console.error("Missing DATABASE_URL in production.");
+  process.exit(1);
+}
+
+if (!process.env.CHANNEL_ID) {
+  console.error("Missing CHANNEL_ID. Set CHANNEL_ID in your environment (.env).");
+  process.exit(1);
+}
+
+if (!isLocal && !process.env.PUBLIC_BASE_URL) {
+  console.error("Missing PUBLIC_BASE_URL in production.");
+  process.exit(1);
 }
 
 const app = express();
@@ -18,13 +32,15 @@ app.use(express.json());
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-});
+const pool = process.env.DATABASE_URL
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+    })
+  : new Pool();
 
 const CHANNEL_ID = process.env.CHANNEL_ID; // e.g. -1001234567890
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL.replace(/\/+$/, ""); // https://xxxx.up.railway.app
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").replace(/\/+$/, ""); // https://xxxx.up.railway.app
 
 // ============ STATE MACHINE ============
 const State = Object.freeze({
@@ -68,9 +84,41 @@ async function ensureSchema() {
 
       pairs TEXT[] NOT NULL DEFAULT '{}',
       is_closed BOOLEAN NOT NULL DEFAULT false,
+      waiting_list TEXT[] NOT NULL DEFAULT '{}',
 
       channel_message_id BIGINT
     );
+  `);
+  // ensure waiting_list exists on older schemas
+  await pool.query("ALTER TABLE games ADD COLUMN IF NOT EXISTS waiting_list TEXT[] NOT NULL DEFAULT '{}' ");
+
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION promote_waiting_pair_on_cancel()
+    RETURNS TRIGGER AS $$
+    DECLARE
+      new_pairs_len INT := COALESCE(array_length(NEW.pairs, 1), 0);
+      old_pairs_len INT := COALESCE(array_length(OLD.pairs, 1), 0);
+      waiting_len INT := COALESCE(array_length(NEW.waiting_list, 1), 0);
+    BEGIN
+      IF new_pairs_len < old_pairs_len AND new_pairs_len < 3 AND waiting_len > 0 THEN
+        NEW.pairs := array_append(COALESCE(NEW.pairs, '{}'::TEXT[]), NEW.waiting_list[1]);
+        NEW.waiting_list := CASE
+          WHEN waiting_len > 1 THEN NEW.waiting_list[2:waiting_len]
+          ELSE '{}'::TEXT[]
+        END;
+      END IF;
+
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+  `);
+
+  await pool.query(`
+    DROP TRIGGER IF EXISTS trg_promote_waiting_pair_on_cancel ON games;
+    CREATE TRIGGER trg_promote_waiting_pair_on_cancel
+    BEFORE UPDATE ON games
+    FOR EACH ROW
+    EXECUTE FUNCTION promote_waiting_pair_on_cancel();
   `);
 }
 
@@ -95,6 +143,8 @@ function organizerContactUrl(userId, username) {
 function formatGameText(game) {
   const pairs = Array.isArray(game.pairs) ? [...game.pairs] : [];
   while (pairs.length < 3) pairs.push("—");
+  const waiting = Array.isArray(game.waiting_list) ? [...game.waiting_list] : [];
+  const waitingText = waiting.length ? waiting.map((w, i) => `${i + 1}. ${w}`).join("\n") : "-";
 
   return `🏸 ${game.location}
 📅 ${game.date}
@@ -107,10 +157,13 @@ ${game.organizer1_name} / ${game.organizer2_name}
 • Мастер + Любитель
 • Два продвинутых любителя
 
-👥 Пары:
+Подтвержденные пары:
 1️⃣ ${pairs[0]}
 2️⃣ ${pairs[1]}
 3️⃣ ${pairs[2]}
+
+Лист ожидания:
+${waitingText}
 
 ℹ️ Выписаться можно только написав организатору.`;
 }
@@ -206,8 +259,7 @@ bot.action(/^join:(\d+)$/, async (ctx) => {
   if (!game) return ctx.reply("Игра не найдена.");
 
   if (game.is_closed) return ctx.reply("⛔ Запись закрыта.");
-  const pairs = Array.isArray(game.pairs) ? game.pairs : [];
-  if (pairs.length >= 3) return ctx.reply("⛔ Уже 3 пары. Запись закрыта.");
+  // allow joining even if main slots are full; extras will go to waiting list
 
   const s = getSession(ctx.from.id);
   s.state = State.JOIN_WAIT_SECOND_PLAYER;
@@ -295,6 +347,15 @@ bot.on("text", async (ctx) => {
         return ctx.reply("Сессия сломалась. /start");
       }
       if (!text) return ctx.reply("Имя/фамилия не должны быть пустыми. Введите ещё раз:");
+      const secondPlayerUsername = String(text).replace(/^@/, "").trim();
+      const { rows: existingUserRows } = await pool.query(
+        "SELECT 1 FROM games WHERE organizer1_username = $1 LIMIT 1",
+        [secondPlayerUsername]
+      );
+      if (!existingUserRows.length) {
+        resetSession(userId);
+        return ctx.reply("Ошибка: указанный username не найден в базе.");
+      }
 
       const game = await loadGame(gameId);
       if (!game) {
@@ -305,43 +366,55 @@ bot.on("text", async (ctx) => {
         resetSession(userId);
         return ctx.reply("⛔ Запись закрыта.");
       }
-
-      // re-check capacity
       const pairs = Array.isArray(game.pairs) ? [...game.pairs] : [];
-      if (pairs.length >= 3) {
-        resetSession(userId);
-        return ctx.reply("⛔ Уже 3 пары. Запись закрыта.");
-      }
+      const waiting = Array.isArray(game.waiting_list) ? [...game.waiting_list] : [];
 
       const firstPlayer = safeFullName(ctx) || "Игрок";
       const secondPlayer = text;
       const pair = `${firstPlayer} / ${secondPlayer}`;
+      const norm = (v) => String(v || "").trim().toLowerCase();
 
-      // prevent duplicate same pair string (simple guard)
-      if (pairs.includes(pair)) {
+      const takenPlayers = new Set(
+        [...pairs, ...waiting]
+          .flatMap((p) => String(p || "").split(" / "))
+          .map((p) => norm(p))
+          .filter(Boolean)
+      );
+
+      if (takenPlayers.has(norm(firstPlayer)) || takenPlayers.has(norm(secondPlayer))) {
+        resetSession(userId);
+        return ctx.reply("Ошибка: один из игроков уже записан на эту игру.");
+      }
+
+      // prevent duplicate in main list or waiting list
+      if (pairs.includes(pair) || waiting.includes(pair)) {
         resetSession(userId);
         return ctx.reply("Эта пара уже записана.");
       }
 
-      // update atomically
-      await pool.query(
-        `UPDATE games
-         SET pairs = array_append(pairs, $1)
-         WHERE id = $2`,
-        [pair, gameId]
-      );
-
-      const updated = await loadGame(gameId);
-      const updatedPairs = Array.isArray(updated.pairs) ? updated.pairs : [];
-
-      if (updatedPairs.length >= 3) {
-        await pool.query("UPDATE games SET is_closed=true WHERE id=$1", [gameId]);
+      const status = pairs.length < 3 ? "confirmed" : "waiting";
+      let addedToMain = false;
+      if (status === "confirmed") {
+        await pool.query(
+          `UPDATE games SET pairs = array_append(pairs, $1) WHERE id = $2`,
+          [pair, gameId]
+        );
+        addedToMain = true;
+      } else {
+        await pool.query(
+          `UPDATE games SET waiting_list = array_append(waiting_list, $1) WHERE id = $2`,
+          [pair, gameId]
+        );
       }
 
       resetSession(userId);
 
       await publishGame(gameId);
-      await ctx.reply("Записал ✅\nЕсли нужно выписаться — напиши организатору.");
+      if (addedToMain) {
+        await ctx.reply("Записал ✅\nЕсли нужно выписаться — напиши организатору.");
+      } else {
+        await ctx.reply("Поставил в очередь ✅\nВы в списке ожидания. Организатор свяжется при появлении слота.");
+      }
 
       return sendMainMenu(ctx);
     }
@@ -364,9 +437,14 @@ async function main() {
   app.listen(port, async () => {
     console.log(`SERVER STARTED ON PORT ${port}`);
 
-    const webhookUrl = `${PUBLIC_BASE_URL}/telegraf`;
-    await bot.telegram.setWebhook(webhookUrl);
-    console.log("WEBHOOK SET", webhookUrl);
+    if (process.env.PUBLIC_BASE_URL) {
+      const webhookUrl = `${PUBLIC_BASE_URL}/telegraf`;
+      await bot.telegram.setWebhook(webhookUrl);
+      console.log("WEBHOOK SET", webhookUrl);
+    } else {
+      await bot.launch();
+      console.log("BOT LAUNCHED (polling mode)");
+    }
   });
 }
 
