@@ -232,6 +232,52 @@ bot.start(async (ctx) => {
   await sendMainMenu(ctx);
 });
 
+bot.command("newgame", async (ctx) => {
+  const now = new Date();
+  const currentDate = `${String(now.getDate()).padStart(2, "0")}.${String(
+    now.getMonth() + 1
+  ).padStart(2, "0")}.${now.getFullYear()}`;
+
+  const organizer1Name = safeFullName(ctx) || "Организатор";
+
+  const { rows } = await pool.query(
+    `INSERT INTO games
+      (location, date, time, organizer1_name, organizer1_user_id, organizer1_username, organizer2_name, pairs, is_closed)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+     RETURNING id`,
+    [
+      "TBD",
+      currentDate,
+      "TBD",
+      organizer1Name,
+      Number(ctx.from.id),
+      ctx.from.username || null,
+      "TBD",
+      [],
+      false,
+    ]
+  );
+
+  await ctx.reply("Game created");
+});
+
+bot.command("games", async (ctx) => {
+  const { rows } = await pool.query("SELECT * FROM games WHERE is_closed=false ORDER BY id DESC LIMIT 1");
+  if (!rows.length) return ctx.reply("No active games");
+
+  const game = rows[0];
+  const confirmedPairs = Array.isArray(game.pairs) && game.pairs.length
+    ? game.pairs.map((pair, idx) => `${idx + 1}. ${pair}`).join("\n")
+    : "-";
+  const waitingList = Array.isArray(game.waiting_list) && game.waiting_list.length
+    ? game.waiting_list.map((pair, idx) => `${idx + 1}. ${pair}`).join("\n")
+    : "-";
+
+  await ctx.reply(
+    `Active game: ${game.id}\n\nConfirmed pairs:\n${confirmedPairs}\n\nWaiting list:\n${waitingList}`
+  );
+});
+
 bot.action("create", async (ctx) => {
   await ctx.answerCbQuery();
   const s = getSession(ctx.from.id);
